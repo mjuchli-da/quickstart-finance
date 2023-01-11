@@ -1,0 +1,90 @@
+module Workflow.Transfer where
+
+import DA.Assert ((===))
+import DA.Set (fromList)
+import Daml.Finance.Interface.Holding.Base qualified as Holding (I)
+import Daml.Finance.Interface.Holding.Transferable qualified as Transferable (I, Transfer(..))
+import Daml.Finance.Interface.Holding.Util (getAmount, getInstrument)
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument (K)
+import Daml.Finance.Interface.Types.Common.Types (AccountKey(..))
+import Daml.Finance.Interface.Account.Account qualified as Account (exerciseInterfaceByKey, I)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (RemoveObservers(..), I, AddObservers(..), Disclosure(..))
+import Daml.Finance.Interface.Holding.Fungible qualified as Fungible (I)
+import Daml.Finance.Interface.Holding.Fungible (splitCids, amounts, Split(Split))
+import DA.List (head)
+import DA.Set (singleton)
+
+
+-- | Initiate / Accept template to transfer a holding to a new owner.
+template Request
+  with
+    receiverAccount : AccountKey
+      -- ^ The account where the holding is sent.
+    instrument : Instrument.K
+      -- ^ The instrument referenced by the holding to be transferred.
+    amount : Decimal
+      -- ^ Number of units to be transferred.
+    currentOwner : Party
+      -- ^ The owner of the holding to be transferred.
+  where
+    signatory receiverAccount.owner
+    observer currentOwner
+
+    ensure amount > 0.0
+
+    choice Accept : ContractId Holding.I
+      with
+        holdingCid : ContractId Holding.I
+      controller currentOwner
+      do
+        -- Sanity checks
+        holding <- fetch holdingCid
+        getInstrument holding === instrument
+
+        -- EXERCISE 1: Split the Holding to Transfer the Right Amount
+        holdingCid <- if (getAmount holding - amount == 0.0) then pure holdingCid else do
+          -- cast the allocated holding to the Fungible interface
+          let fungibleCid = coerceInterfaceContractId @Fungible.I holdingCid
+          -- use th7e Split choice to split the larger holding into two holdings
+          splitRes <- exercise fungibleCid Split with amounts = [amount]
+          -- cast the Fungible to a Transferable (MJ: actually Holding) using toInterfaceContractId.
+          pure . head $ toInterfaceContractId @Holding.I <$> splitCids splitRes
+
+        
+
+        -- DO_TRANSFER_BEGIN
+        let transferableCid = coerceInterfaceContractId @Transferable.I holdingCid
+
+        newTransferableCid <- exercise transferableCid Transferable.Transfer with
+          actors = fromList [currentOwner, receiverAccount.owner]
+          newOwnerAccount = receiverAccount
+
+        pure $ toInterfaceContractId @Holding.I newTransferableCid
+        -- DO_TRANSFER_END
+
+    -- EXERCISE 2: Temporary Account Disclosure
+    -- Bob’s account is disclosed to Alice once the transfer is initiated
+    -- When the Transfer is executed, Alice removes herself from the account observers
+    -- In order to do that, you can leverage the fact that Account implements the Disclosure interface. 
+    -- This interface exposes the AddObservers and RemoveObservers choices, 
+    -- which can be used to disclose / undisclose Bob’s account contract to Alice. 
+    -- In order to exercise these choices, you can use the Account.exerciseInterfaceByKey utility function.
+    nonconsuming choice AddObserver : ContractId Disclosure.I
+      with
+        newObserver : Party
+      controller receiverAccount.owner
+      do
+        Account.exerciseInterfaceByKey @Disclosure.I receiverAccount receiverAccount.owner Disclosure.AddObservers
+          with
+            disclosers = singleton receiverAccount.owner
+            observersToAdd = ("Disclosure context", singleton currentOwner)
+        
+    choice Decline : ()
+      -- ^ Decline the request.
+      controller currentOwner
+      do pure ()
+
+    choice Withdraw : ()
+      -- ^ Withdraw the request.
+      controller receiverAccount.owner
+      do pure ()

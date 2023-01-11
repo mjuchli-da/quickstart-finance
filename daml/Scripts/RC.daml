@@ -1,0 +1,67 @@
+module Scripts.RC where
+
+import Daml.Finance.Interface.Types.Common.Types (Id, InstrumentKey(..), PartiesMap)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as BaseInstrument (I, View(..), disclosureUpdateReference)
+import DA.Set (singleton)
+import Daml.Finance.Util.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+import Daml.Finance.Interface.Claims.Claim qualified as Claim (I, View(..))
+import ContingentClaims.Core.Claim (one, scale, when)
+import Daml.Finance.Interface.Claims.Types (C, TaggedClaim(..))
+import ContingentClaims.Core.Internal.Claim (Inequality(TimeGte))
+import ContingentClaims.Core.Observation (Observation(Const, Observe))
+import DA.Time (time)
+
+template RC
+    with
+        issuer : Party
+        depository : Party
+        id : Id
+        version : Text
+        description : Text
+        observers : PartiesMap
+        validAsOf : Time
+        acquisitionTime : Time
+        cashInstrument : InstrumentKey
+        underlying : InstrumentKey
+        ticker : Text
+        initialPrice : Decimal
+        knockIn: Decimal
+        maturity : Date
+        coupon : Decimal
+    where
+        ensure validAsOf <= acquisitionTime
+
+        signatory depository, issuer
+        observer Disclosure.flattenObservers observers
+
+        let instrument = InstrumentKey with depository; issuer; id; version
+            maturityTime = time maturity 0 0 0
+            claim: C = mconcat [ 
+                              when (TimeGte $ maturityTime) $ scale (Const coupon) $ one cashInstrument
+                            , when (TimeGte $ maturityTime) $ one cashInstrument
+                            , when (TimeGte $ maturityTime) $ one underlying
+                            , when (TimeGte $ maturityTime) $ scale (Observe ticker) $ one cashInstrument
+                        ]
+
+        interface instance BaseInstrument.I for RC where
+            asDisclosure = toInterface @Disclosure.I this
+            view = BaseInstrument.View with issuer; depository; id; version; description; validAsOf
+            getKey = instrument
+
+        interface instance Disclosure.I for RC where
+            view = Disclosure.View with disclosureControllers = singleton issuer; observers
+            setObservers = setObserversImpl this $
+                Some (BaseInstrument.disclosureUpdateReference instrument)
+            addObservers = addObserversImpl this $
+                Some (BaseInstrument.disclosureUpdateReference instrument)
+            removeObservers = removeObserversImpl this $
+                Some (BaseInstrument.disclosureUpdateReference instrument)
+
+        interface instance Claim.I for RC where
+            view = Claim.View with acquisitionTime
+            asBaseInstrument = toInterface @BaseInstrument.I this
+            getClaims _ = pure [TaggedClaim with tag = "RC", claim = claim]
+
+
+

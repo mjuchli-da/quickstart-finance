@@ -1,0 +1,122 @@
+module Scripts.Struct where
+
+import Daml.Script
+import DA.Map qualified as M
+
+import DA.Date (addDays, toDateUTC)
+import Daml.Finance.Interface.Types.Common.Types (Id(..), InstrumentKey, Parties)
+import Daml.Finance.Instrument.Token.Instrument (Instrument(..))
+import Daml.Finance.Instrument.Generic.Instrument qualified as Generic (Instrument(..))
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument (GetView(..), I, Reference(..))
+import DA.Set (singleton)
+import Daml.Finance.Interface.Claims.Types (C)
+import Daml.Finance.Data.Time.DateClock.Types (Unit(..))
+import Daml.Finance.Interface.Types.Date.Classes (toUTCTime)
+import Scripts.RC (RC(..))
+import DA.Time (time)
+import Daml.Finance.Data.Numeric.Observation (Observation(..))
+import Daml.Finance.Interface.Lifecycle.Observable.NumericObservable qualified as NumericObservable (I)
+import DA.Math qualified as Math
+
+-- | Create parties
+createParties : [Text] -> Script [Party]
+createParties names = mapA createParty names where
+    createParty name = allocatePartyWithHint name $ PartyIdHint name
+
+-- | Create a `Reference` for an instrument.
+-- Note: This should only be called together with an instrument creation
+createReference : ContractId Instrument.I -> Party -> Party -> [(Text, Parties)] ->
+  Script InstrumentKey
+createReference cid depository issuer observers = do
+    instrumentView <- submitMulti [depository, issuer] [] do
+        exerciseCmd cid Instrument.GetView with viewer = issuer
+    let ref = Instrument.Reference with instrumentView; cid; observers = M.fromList observers
+    submitMulti [depository, issuer] [] do createCmd ref
+    pure $ key ref
+
+-- | Originate an `Instrument`.
+originate : Party -> Party -> Text -> Text-> [(Text, Parties)] -> Time -> Script InstrumentKey
+originate depository issuer label description observers timestamp = do
+  cid <- toInterfaceContractId <$> submitMulti [depository, issuer] [] do
+    createCmd Instrument with
+      depository; issuer; id = Id label; version = "0"; description
+      observers = M.fromList observers; validAsOf = timestamp
+  createReference cid depository issuer observers
+
+originateEquity : Party -> Party -> Text -> Text -> Text -> [(Text, Parties)] -> Time ->
+  Script InstrumentKey
+originateEquity depository issuer label version description observers timestamp = do
+  cid <- toInterfaceContractId <$> submitMulti [depository, issuer] [] do
+    createCmd Instrument with
+      depository; issuer; id = Id label; version; description
+      observers = M.fromList observers; validAsOf = timestamp
+  createReference cid depository issuer observers
+
+-- | Originate generic instrument
+originateGeneric : Party -> Party -> Text -> Text -> Time -> C -> [(Text, Parties)] -> Time ->
+  Script InstrumentKey
+originateGeneric depository issuer label description acquisitionTime claims observers
+    lastEventTimestamp = do
+        cid <- toInterfaceContractId <$> submitMulti [depository, issuer] [] do
+          createCmd Generic.Instrument with
+            depository; issuer; id = Id label; version = "0"; description; acquisitionTime; claims
+            observers = M.fromList observers; lastEventTimestamp
+        createReference cid depository issuer observers
+
+-- | Maps a `Date` to `Time` using the rule in the `DateClock`.
+dateToDateClockTime : Date -> Time
+dateToDateClockTime = toUTCTime . Unit
+
+runStruct : Script ()
+runStruct = do
+
+    [depository, custodian, issuer, investor, calendarDataProvider, publicParty] <-
+        createParties ["Depository", "Custodian", "Issuer", "Investor", "Calendar Data Provider", "PublicParty"]
+    let pp = [("FactoryProvider", singleton publicParty)]
+
+    now <- getTime
+    let ticker = "ABC.DE"
+    cashInstrument <- originate depository issuer "EUR" "Euro" pp now
+    underlying <- originateEquity issuer issuer ticker "0" ticker pp now
+
+    let
+        today = toDateUTC now
+        maturity = addDays today 180
+        coupon = 0.1
+        initialPrice = 100.0
+        knockIn = 0.8
+        structLabel = "RC " <> ticker <> " " <> show (coupon * 100.0) <> "% " <> show maturity <> " DA"
+
+    
+    let observations = M.fromList $ map (\i -> 
+            (dateToDateClockTime (addDays today i), sin' i)) 
+            [1..180]
+            where sin' i = initialPrice + Math.sin(intToDecimal i) * initialPrice * (1.1-knockIn)
+
+    observableCid: ContractId NumericObservable.I <- toInterfaceContractId <$> submit issuer do
+        createCmd Observation with
+            provider = issuer; id = Id ticker; observations; observers = M.empty
+
+    -- Alternatively one could use the generic instrument
+    -- instrument <- originateGeneric depository issuer structLabel "Struct" now claims pp now
+    rcCid : ContractId Instrument.I <- toInterfaceContractId <$> submitMulti [depository, issuer] [] do
+        createCmd RC with 
+            depository = depository
+                , issuer = issuer
+                , id = Id structLabel
+                , version = "0"
+                , description = structLabel
+                , observers = M.fromList pp
+                , validAsOf = time today 0 0 0
+                , acquisitionTime = time today 0 0 0
+                , cashInstrument = cashInstrument
+                , underlying = underlying
+                , ticker = ticker
+                , initialPrice = initialPrice
+                , knockIn = knockIn
+                , maturity = maturity
+                , coupon = coupon
+    
+    rc <- createReference rcCid depository issuer pp
+
+    return ()
