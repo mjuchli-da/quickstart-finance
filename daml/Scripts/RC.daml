@@ -2,15 +2,17 @@ module Scripts.RC where
 
 import Daml.Finance.Interface.Types.Common.Types (Id, InstrumentKey(..), PartiesMap)
 import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
-import Daml.Finance.Interface.Instrument.Base.Instrument qualified as BaseInstrument (I, View(..), disclosureUpdateReference)
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as BaseInstrument (I, View(..), disclosureUpdateReference, createReference)
 import DA.Set (singleton)
 import Daml.Finance.Util.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
 import Daml.Finance.Interface.Claims.Claim qualified as Claim (I, View(..))
-import ContingentClaims.Core.Claim (one, scale, when)
+import ContingentClaims.Core.Claim (one, scale, when, and)
 import Daml.Finance.Interface.Claims.Types (C, TaggedClaim(..))
-import ContingentClaims.Core.Internal.Claim (Inequality(TimeGte))
+import ContingentClaims.Core.Internal.Claim (Inequality(TimeGte, Lte))
 import ContingentClaims.Core.Observation (Observation(Const, Observe))
 import DA.Time (time)
+import Daml.Finance.Interface.Claims.Dynamic.Instrument qualified as DynamicInstrument (I, CreateNewVersion(..), View(..))
+import Prelude hiding (and)
 
 template RC
     with
@@ -29,19 +31,23 @@ template RC
         knockIn: Decimal
         maturity : Date
         coupon : Decimal
+        lastEventTimestamp : Time
+
     where
         ensure validAsOf <= acquisitionTime
+
 
         signatory depository, issuer
         observer Disclosure.flattenObservers observers
 
         let instrument = InstrumentKey with depository; issuer; id; version
+            knockInPrice = knockIn * initialPrice
             maturityTime = time maturity 0 0 0
             claim: C = mconcat [ 
                               when (TimeGte $ maturityTime) $ scale (Const coupon) $ one cashInstrument
-                            , when (TimeGte $ maturityTime) $ one cashInstrument
-                            , when (TimeGte $ maturityTime) $ one underlying
-                            , when (TimeGte $ maturityTime) $ scale (Observe ticker) $ one cashInstrument
+                            , when (TimeGte $ maturityTime) 
+                                $ when (Lte (Observe ticker, Const knockInPrice)) 
+                                    $ one underlying
                         ]
 
         interface instance BaseInstrument.I for RC where
@@ -63,5 +69,10 @@ template RC
             asBaseInstrument = toInterface @BaseInstrument.I this
             getClaims _ = pure [TaggedClaim with tag = "RC", claim = claim]
 
-
+        interface instance DynamicInstrument.I for RC where
+            view = DynamicInstrument.View with lifecycler = issuer; lastEventTimestamp
+            createNewVersion DynamicInstrument.CreateNewVersion{version; lastEventTimestamp} = do
+                cid <- create this with version, lastEventTimestamp
+                BaseInstrument.createReference issuer $ toInterfaceContractId cid
+                pure $ toInterfaceContractId cid
 

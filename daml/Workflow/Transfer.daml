@@ -13,7 +13,7 @@ import Daml.Finance.Interface.Holding.Fungible qualified as Fungible (I)
 import Daml.Finance.Interface.Holding.Fungible (splitCids, amounts, Split(Split))
 import DA.List (head)
 import DA.Set (singleton)
-
+import Workflow.Test
 
 -- | Initiate / Accept template to transfer a holding to a new owner.
 template Request
@@ -69,12 +69,13 @@ template Request
     -- This interface exposes the AddObservers and RemoveObservers choices, 
     -- which can be used to disclose / undisclose Bob’s account contract to Alice. 
     -- In order to exercise these choices, you can use the Account.exerciseInterfaceByKey utility function.
-    nonconsuming choice AddObserver : ContractId Disclosure.I
+
+    nonconsuming choice MyChoice : ContractId Disclosure.I
       with
         newObserver : Party
       controller receiverAccount.owner
       do
-        Account.exerciseInterfaceByKey @Disclosure.I receiverAccount receiverAccount.owner Disclosure.AddObservers
+        Account.exerciseInterfaceByKey @Disclosure.Disclosure receiverAccount receiverAccount.owner Disclosure.AddObservers
           with
             disclosers = singleton receiverAccount.owner
             observersToAdd = ("Disclosure context", singleton currentOwner)
